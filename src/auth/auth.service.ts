@@ -1,51 +1,58 @@
-import {
-    Injectable,
-    OnApplicationBootstrap,
-    OnApplicationShutdown,
-  } from '@nestjs/common';
-import Redis from 'ioredis';
-import { ConfigService } from '@nestjs/config';
-import { SignInDto } from './sign-in.dto';
+import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
+import { SignInDto } from './dto/sign-in.dto';
 import { JwtService } from '@nestjs/jwt';
 import { UsersService } from '../users/users.service';
-
-export class InvalidatedRefreshTokenError extends Error {}
+import { ConfigService } from '@nestjs/config';
+import { Repository } from 'typeorm';
+import { User } from '../users/user.entity';
+import { InjectRepository } from '@nestjs/typeorm';
+import { RefreshTokenIdsStorage } from './refresh-token-ids-storage';
+import { TokenExpiredError } from 'jsonwebtoken';
+import { JwtRefreshTokenStrategy } from './strategy/jwt-refresh-token.strategy';
 
 @Injectable()
-export class RefreshTokenIdsStorage
-  implements OnApplicationBootstrap, OnApplicationShutdown
-{
-  private redisClient: Redis;
-  constructor(private configService: ConfigService) {}
-  onApplicationBootstrap() {
-    this.redisClient = new Redis({
-      host: this.configService.get('REDIS_HOST'),
-      port: this.configService.get('REDIS_PORT'),
-    });
-  }
+export class AuthService {
+  private readonly logger = new Logger(JwtRefreshTokenStrategy.name);
 
-  onApplicationShutdown(signal?: string) {
-    return this.redisClient.quit();
-  }
-
-  async insert(userId: number, tokenId: string): Promise<void> {
-    await this.redisClient.set(this.getKey(userId), tokenId);
-  }
-
-  async validate(userId: number, tokenId: string): Promise<boolean> {
-    const storedId = await this.redisClient.get(this.getKey(userId));
-    if (storedId !== tokenId) {
-      throw new InvalidatedRefreshTokenError();
+  constructor(
+    @InjectRepository(User)
+    private usersRepository: Repository<User>,
+    private readonly jwtService: JwtService,
+    private readonly usersService: UsersService,
+    private readonly configService: ConfigService,
+    private readonly refreshTokenIdsStorage: RefreshTokenIdsStorage,
+  ) {}
+  async signIn(signInDto: SignInDto) {
+    const user = await this.validateUser(
+      signInDto.username,
+      signInDto.password,
+    );
+    if (!user) {
+      throw new UnauthorizedException('Invalid username or password');
     }
-    return storedId === tokenId;
+
+    const payload = { sub: user.id, username: user.username };
+    const accessToken = await this.jwtService.signAsync(payload);
+    const refreshToken = await this.jwtService.signAsync(payload, {
+      expiresIn: '1d',
+    });
+
+    // Store the refresh token in redis
+    await this.refreshTokenIdsStorage.insert(user.id, refreshToken);
+
+    return {
+      access_token: accessToken,
+      refresh_token: refreshToken,
+    };
   }
 
-  async invalidate(userId: number): Promise<void> {
-    await this.redisClient.del(this.getKey(userId));
-  }
-
-  private getKey(userId: number): string {
-    return `user-${userId}`;
+  async validateUser(username: string, password: string): Promise<any> {
+    const user = await this.usersService.findByUsername(username);
+    if (user && (await user.validatePassword(password))) {
+      const { password, ...result } = user;
+      return result;
+    }
+    return null;
   }
 
   async refreshAccessToken(
@@ -71,75 +78,4 @@ export class RefreshTokenIdsStorage
       throw new UnauthorizedException('Invalid access token');
     }
   }
-
-}
-
-
-@Injectable()
-export class AuthService {
-    constructor(
-        private readonly usersService: UsersService,
-        private readonly jwtService: JwtService,
-      ) {}
-    async create(registerUserDto: RegisterUserDto): Promise<User> {
-        const { username, password } = registerUserDto;
-    
-        const salt = await bcrypt.genSalt();
-        const hashedPassword = await bcrypt.hash(password, salt);
-    
-        const user = new User();
-        user.username = username;
-        user.password = hashedPassword;
-    
-        return this.userRepository.save(user);
-      }
-
-      async signIn(signInDto: SignInDto) {
-        const { username, password } = signInDto;
-    
-        const user = await this.usersService.findByUsername(username);
-    
-        if (!user) {
-          throw new UnauthorizedException('Invalid username or password');
-        }
-    
-        const passwordIsValid = await user.validatePassword(password);
-    
-        if (!passwordIsValid) {
-          throw new UnauthorizedException('Invalid username or password');
-        }
-    
-        const payload = { sub: user.id, username: user.username };
-        const accessToken = await this.jwtService.signAsync(payload);
-    
-        return { access_token: accessToken };
-      }
-
-      async findOne(id: number): Promise<User> {
-        return this.userRepository.findOne(id);
-    }
-    
-    async findByUsername(username: string): Promise<User> {
-      return this.userRepository.findOne({ where: { username } });
-    }
-
-    
-  async validateUser(username: string, password: string): Promise<any> {
-    const user = await this.usersService.findByUsername(username);
-    if (user && (await user.validatePassword(password))) {
-      const { password, ...result } = user;
-      return result;
-    }
-    return null;
-  }
-  async invalidateToken(accessToken: string): Promise<void> {
-  try {
-    const decoded = await this.jwtService.verifyAsync(accessToken);
-    await this.refreshTokenIdsStorage.invalidate(decoded.sub);
-  } catch (error) {
-    throw new UnauthorizedException('Invalid access token');
-  }
-}
-    
-
 }
