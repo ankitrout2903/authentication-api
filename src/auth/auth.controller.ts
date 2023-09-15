@@ -19,7 +19,15 @@ export class AuthController {
   async refreshToken(@Body() refreshTokenDto: RefreshTokenDto) {
     return this.authService.refreshAccessToken(refreshTokenDto.refresh_token);
   }
-  
+
+  @UseGuards(JwtAuthGuard)
+@Post('invalidate-token')
+async invalidateToken(@Headers('authorization') authorization: string) {
+  const token = authorization.split(' ')[1];
+  await this.authService.invalidateToken(token);
+  return { message: 'Token invalidated successfully' };
+}
+
   @Public()
 @Post('sign-in')
 async signIn(@Body() signInDto: SignInDto) {
